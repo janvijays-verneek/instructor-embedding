@@ -107,6 +107,8 @@ class InstructorTrainer(Seq2SeqTrainer):
         embeddings_pos = cur_results['pos']
         embeddings_neg = cur_results['neg']
 
+        # computation of contrastive loss 
+
         num = len(embeddings_query)
         all_scores = None
         from torch import nn
@@ -146,6 +148,25 @@ class InstructorTrainer(Seq2SeqTrainer):
                 all_another_scores = torch.cat([all_another_scores, cur_score.unsqueeze(0)], dim=0)
         labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeddings_query.device)
         loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
+
+        # computation of sigmoid loss for learning relevancy in query and products
+
+        bce_loss = nn.BCELoss()
+        targets = []
+        # positive exmaples
+        ones_embeds = torch.cat((embeddings_query, embeddings_pos), dim=1)
+        targets.extend([1 for _ in range(num)])
+        # negative examples
+        zeros_embeds = torch.cat((embeddings_query, embeddings_neg), dim=1)
+        targets.extend([0 for _ in range(num)])
+        # all examples
+        all_class_embeds = torch.cat((ones_embeds, zeros_embeds), dim=0)
+        all_targets = torch.tensor(targets, dtype=torch.float32)
+        # forward pass and compute loss
+        sigmoid_output = model._modules["6"](model._modules["5"](model._modules["4"](all_class_embeds)))
+        sigmoid_loss = bce_loss(sigmoid_output)
+
+        loss += sigmoid_loss
 
         return loss
 

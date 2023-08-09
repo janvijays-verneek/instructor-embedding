@@ -7,7 +7,7 @@ import numpy as np
 from tqdm.autonotebook import trange
 from torch import Tensor, device
 from sentence_transformers import SentenceTransformer
-from sentence_transformers.models import Transformer
+from sentence_transformers.models import Transformer, Dense
 from transformers import AutoConfig
 from transformers import AutoTokenizer
 from collections import OrderedDict
@@ -461,6 +461,7 @@ class INSTRUCTOR(SentenceTransformer):
         with open(modules_json_path) as fIn:
             modules_config = json.load(fIn)
 
+        classifier_included = False
         modules = OrderedDict()
         for module_config in modules_config:
             if module_config['idx']==0:
@@ -468,10 +469,38 @@ class INSTRUCTOR(SentenceTransformer):
                 module_class = INSTRUCTOR_Transformer
             elif module_config['idx']==1:
                 module_class = INSTRUCTOR_Pooling
-            else:
+            elif module_config['idx'] in [2, 3]: # for modules 2_Dense and 3_Normalize
                 module_class = import_from_string(module_config['type'])
+            elif module_config['idx'] in [4, 5, 6]: # classifier layers
+                classifier_included = True
+                module_class = import_from_string(module_config['type'])
+            else:
+                assert(False), f"Unable to import the class associated with the module '{module_config['type']}'. Please ensure the module type is correct and available."
             module = module_class.load(os.path.join(model_path, module_config['path']))
             modules[module_config['name']] = module
+
+        if not classifier_included: # not trained classifier
+            print("embedding classifier not found! loading with randomly initilised weights...")
+            
+            classifiers_config = [ {"idx": module_idx,
+                                    "name": f"{module_idx}",
+                                    "path": f"{module_idx}_Classifier",
+                                    "type": "sentence_transformers.models.Dense"} for module_idx in range(4, 7) ]
+
+            idx2specs = {
+                            4: {'in_features': 1472, 'out_features': 512, 'activation_function': nn.ReLU()},
+                            5: {'in_features': 512, 'out_features': 256, 'activation_function': nn.ReLU()},
+                            6: {'in_features': 256, 'out_features': 1, 'activation_function': nn.Sigmoid()}
+                        }
+
+            for classifier_config in classifiers_config:
+                # updating the modules_config with additional classification layers
+                modules_config.append(classifier_config)
+                # adding the new classification layers to modules
+                module_class = import_from_string(classifier_config['type'])
+                specs = idx2specs[classifier_config["idx"]]
+                module = module_class(in_features=specs['in_features'], out_features=specs['out_features'], activation_function=specs['activation_function'])
+                modules[classifier_config['name']] = module
 
         return modules
 
