@@ -392,13 +392,6 @@ class INSTRUCTOR(SentenceTransformer):
             x = self._modules[str(module_idx)](x)
         return x
     
-    def compute_relevance(self, concat_embeds):
-        module_input = {'sentence_embedding': concat_embeds}
-        for module_idx in range(4, 7): # forward pass for classification head
-            module_input = self._modules[str(module_idx)](module_input)
-        relevance_scores = module_input['sentence_embedding'].squeeze()
-        return relevance_scores
-    
     def smart_batching_collate(self, batch):
         num_texts = len(batch[0].texts)
         texts = [[] for _ in range(num_texts)]

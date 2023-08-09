@@ -107,8 +107,12 @@ class InstructorTrainer(Seq2SeqTrainer):
         num = embeddings_query.size(0)
         all_targets = torch.cat([torch.ones(num), torch.zeros(num)], dim=0).to(embeddings_query.device)
 
-        # Compute relevance scores and loss
-        rel_scores = model.compute_relevance(all_class_embeds)
+        # Compute relevance scores and sigmoid loss
+        module_input = {'sentence_embedding': all_class_embeds}
+        for module_idx in range(4, 7): # forward pass for classification head
+            module_input = self._modules[str(module_idx)](module_input)
+        rel_scores = module_input['sentence_embedding'].squeeze()
+    
         sigmoid_loss = nn.BCELoss()(rel_scores, all_targets)
 
         return sigmoid_loss
@@ -197,11 +201,11 @@ class InstructorTrainer(Seq2SeqTrainer):
 
         # computation of contrastive loss to bring move relevant prods close to query and irrelevant prods away from query
         if self.use_loop_loss:
-            # print("using loop")
+            print("using loop")
             contrastive_loss = self.loop_compute_contrastive_loss(embeddings_query, embeddings_pos, embeddings_neg)
         else:
             # optimised w/o loops  
-            # print("not using loop")
+            print("not using loop")
             contrastive_loss = self.compute_contrastive_loss(embeddings_query, embeddings_pos, embeddings_neg)
         
         # computation of sigmoid loss for learning relevancy in query and product pair
