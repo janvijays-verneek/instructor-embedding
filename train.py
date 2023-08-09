@@ -197,11 +197,11 @@ class InstructorTrainer(Seq2SeqTrainer):
 
         # computation of contrastive loss to bring move relevant prods close to query and irrelevant prods away from query
         if self.use_loop_loss:
-            print("using loop")
+            # print("using loop")
             contrastive_loss = self.loop_compute_contrastive_loss(embeddings_query, embeddings_pos, embeddings_neg)
         else:
             # optimised w/o loops  
-            print("not using loop")
+            # print("not using loop")
             contrastive_loss = self.compute_contrastive_loss(embeddings_query, embeddings_pos, embeddings_neg)
         
         # computation of sigmoid loss for learning relevancy in query and product pair
