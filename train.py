@@ -110,7 +110,7 @@ class InstructorTrainer(Seq2SeqTrainer):
         # Compute relevance scores and sigmoid loss
         module_input = {'sentence_embedding': all_class_embeds}
         for module_idx in range(4, 7): # forward pass for classification head
-            module_input = self._modules[str(module_idx)](module_input)
+            module_input = model._modules[str(module_idx)](module_input)
         rel_scores = module_input['sentence_embedding'].squeeze()
     
         sigmoid_loss = nn.BCELoss()(rel_scores, all_targets)
