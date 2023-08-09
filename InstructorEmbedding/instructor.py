@@ -385,7 +385,20 @@ class INSTRUCTOR_Transformer(Transformer):
         return output
 
 class INSTRUCTOR(SentenceTransformer):
-
+    
+    def forward(self, x):
+        # Pass input through the first four modules only
+        for module_idx in range(0, 4): # only forward pass across first four modules (skipping the classification head layers)
+            x = self._modules[str(module_idx)](x)
+        return x
+    
+    def compute_relevance(self, concat_embeds):
+        module_input = {'sentence_embedding': concat_embeds}
+        for module_idx in range(4, 7): # forward pass for classification head
+            module_input = self._modules[str(module_idx)](module_input)
+        relevance_scores = module_input['sentence_embedding'].squeeze()
+        return relevance_scores
+    
     def smart_batching_collate(self, batch):
         num_texts = len(batch[0].texts)
         texts = [[] for _ in range(num_texts)]
@@ -488,7 +501,7 @@ class INSTRUCTOR(SentenceTransformer):
                                     "type": "sentence_transformers.models.Dense"} for module_idx in range(4, 7) ]
 
             idx2specs = {
-                            4: {'in_features': 1472, 'out_features': 512, 'activation_function': nn.ReLU()},
+                            4: {'in_features': 1536, 'out_features': 512, 'activation_function': nn.ReLU()},
                             5: {'in_features': 512, 'out_features': 256, 'activation_function': nn.ReLU()},
                             6: {'in_features': 256, 'out_features': 1, 'activation_function': nn.Sigmoid()}
                         }

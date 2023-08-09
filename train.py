@@ -107,7 +107,7 @@ class InstructorTrainer(Seq2SeqTrainer):
         embeddings_pos = cur_results['pos']
         embeddings_neg = cur_results['neg']
 
-        # computation of contrastive loss 
+        # computation of contrastive loss to bring move relevant prods close to query and irrelevant prods away from query
 
         num = len(embeddings_query)
         all_scores = None
@@ -128,7 +128,7 @@ class InstructorTrainer(Seq2SeqTrainer):
                 all_scores = torch.cat([all_scores, cur_score.unsqueeze(0)], dim=0)
 
         labels = torch.zeros(all_scores.size(0)).long().to(embeddings_query.device)
-        loss = nn.CrossEntropyLoss()(all_scores, labels)
+        contrastive_loss = nn.CrossEntropyLoss()(all_scores, labels)
 
         all_another_scores = None
         for i in range(0, num):
@@ -147,10 +147,10 @@ class InstructorTrainer(Seq2SeqTrainer):
             else:
                 all_another_scores = torch.cat([all_another_scores, cur_score.unsqueeze(0)], dim=0)
         labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeddings_query.device)
-        loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
-
-        # computation of sigmoid loss for learning relevancy in query and products
-
+        contrastive_loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
+        contrastive_loss = contrastive_loss / 2.0
+        
+        # computation of sigmoid loss for learning relevancy in query and product pair
         bce_loss = nn.BCELoss()
         targets = []
         # positive exmaples
@@ -161,12 +161,13 @@ class InstructorTrainer(Seq2SeqTrainer):
         targets.extend([0 for _ in range(num)])
         # all examples
         all_class_embeds = torch.cat((ones_embeds, zeros_embeds), dim=0)
-        all_targets = torch.tensor(targets, dtype=torch.float32)
+        all_targets = torch.tensor(targets, dtype=torch.float32).to(all_class_embeds.device)
         # forward pass and compute loss
-        sigmoid_output = model._modules["6"](model._modules["5"](model._modules["4"](all_class_embeds)))
-        sigmoid_loss = bce_loss(sigmoid_output)
-
-        loss += sigmoid_loss
+        rel_scores = model.compute_relevance(all_class_embeds)
+        sigmoid_loss = bce_loss(rel_scores, all_targets)
+        
+        # total loss
+        loss = 1.0 * sigmoid_loss + 1.0 * contrastive_loss
 
         return loss
 
