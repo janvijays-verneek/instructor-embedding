@@ -32,6 +32,7 @@ from torch.utils.data import Dataset, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from transformers.utils.versions import require_version
 from datasets import Dataset,DatasetDict
+import torch.nn as nn
 
 
 check_min_version("4.20.0.dev0")
@@ -63,6 +64,10 @@ def has_length(dataset):
         return False
 
 class InstructorTrainer(Seq2SeqTrainer):
+    def __init__(self, use_loop_loss=True, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_loop_loss = use_loop_loss
+    
     def _get_train_sampler(self) :
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
@@ -90,29 +95,29 @@ class InstructorTrainer(Seq2SeqTrainer):
                 rank=self.args.process_index,
                 seed=seed,
             )
+        
+    def compute_sigmoid_loss(self, embeddings_query, embeddings_pos, embeddings_neg, model):
+        # Concatenate embeddings
+        all_class_embeds = torch.cat([
+            torch.cat((embeddings_query, embeddings_pos), dim=1),
+            torch.cat((embeddings_query, embeddings_neg), dim=1)
+        ], dim=0)
 
-    def compute_loss(self, model, inputs, return_outputs=False):
-        for task_id in inputs['task_name']:
-            assert task_id==inputs['task_name'][0],f"Examples in the same batch should come from the same task, " \
-                                                 f"but task {task_id} and task {inputs['task_name'][0]} are found"
-        cur_results = {}
-        for k in ['query', 'pos', 'neg']:
-            cur_inputs = {
-                'input_ids': inputs[f'{k}_input_ids'],
-                'attention_mask': inputs[f'{k}_attention_mask'],
-                'context_masks': inputs[f'{k}_context_masks'],
-            }
-            cur_results[k] = model(cur_inputs)['sentence_embedding']
-        embeddings_query = cur_results['query']
-        embeddings_pos = cur_results['pos']
-        embeddings_neg = cur_results['neg']
+        # Create targets tensor directly in the device of the embeddings
+        num = embeddings_query.size(0)
+        all_targets = torch.cat([torch.ones(num), torch.zeros(num)], dim=0).to(embeddings_query.device)
 
-        # computation of contrastive loss to bring move relevant prods close to query and irrelevant prods away from query
+        # Compute relevance scores and loss
+        rel_scores = model.compute_relevance(all_class_embeds)
+        sigmoid_loss = nn.BCELoss()(rel_scores, all_targets)
 
+        return sigmoid_loss
+    
+    def loop_compute_contrastive_loss(self, embeddings_query, embeddings_pos, embeddings_neg):
         num = len(embeddings_query)
         all_scores = None
-        from torch import nn
         similarity_fct = nn.CosineSimilarity(dim=-1)
+
         for i in range(0, num):
             anchor_emb = embeddings_query[i].unsqueeze(0)
             pos_emb = embeddings_pos[i].unsqueeze(0)
@@ -146,26 +151,62 @@ class InstructorTrainer(Seq2SeqTrainer):
                 all_another_scores = cur_score.unsqueeze(0)
             else:
                 all_another_scores = torch.cat([all_another_scores, cur_score.unsqueeze(0)], dim=0)
+
         labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeddings_query.device)
         contrastive_loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
-        contrastive_loss = contrastive_loss / 2.0
+
+        return contrastive_loss / 2.0
+
+    def compute_contrastive_loss(self, embeddings_query, embeddings_pos, embeddings_neg):
+        num = len(embeddings_query)
+        similarity_fct = nn.CosineSimilarity(dim=-1)
+
+        # Compute similarity scores between query and pos/neg embeddings
+        query_pos_sim = similarity_fct(embeddings_query, embeddings_pos) / self.args.cl_temperature
+        query_neg_sims = similarity_fct(embeddings_query.unsqueeze(1), embeddings_neg) / self.args.cl_temperature
+        all_scores = torch.cat([query_pos_sim.unsqueeze(-1), query_neg_sims], dim=-1)
+        labels = torch.zeros(all_scores.size(0)).long().to(embeddings_query.device)
+        contrastive_loss = nn.CrossEntropyLoss()(all_scores, labels)
+
+        # Compute similarity scores between pos embeddings and query/neg embeddings
+        pos_query_sim = similarity_fct(embeddings_pos, embeddings_query) / self.args.cl_temperature
+        neg_sims_matrix = similarity_fct(embeddings_pos.unsqueeze(1), embeddings_query.unsqueeze(0)) / self.args.cl_temperature
+        inf_diagonal = torch.diag(torch.full((num,), float('-inf'))).to(embeddings_query.device)
+        neg_sims_matrix += inf_diagonal
+        all_another_scores = torch.cat([pos_query_sim.unsqueeze(-1), neg_sims_matrix], dim=-1)
+        labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeddings_query.device)
+        contrastive_loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
+
+        return contrastive_loss / 2.0
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        for task_id in inputs['task_name']:
+            assert task_id==inputs['task_name'][0],f"Examples in the same batch should come from the same task, " \
+                                                 f"but task {task_id} and task {inputs['task_name'][0]} are found"
+        cur_results = {}
+        for k in ['query', 'pos', 'neg']:
+            cur_inputs = {
+                'input_ids': inputs[f'{k}_input_ids'],
+                'attention_mask': inputs[f'{k}_attention_mask'],
+                'context_masks': inputs[f'{k}_context_masks'],
+            }
+            cur_results[k] = model(cur_inputs)['sentence_embedding']
+        embeddings_query = cur_results['query']
+        embeddings_pos = cur_results['pos']
+        embeddings_neg = cur_results['neg']
+
+        # computation of contrastive loss to bring move relevant prods close to query and irrelevant prods away from query
+        if self.use_loop_loss:
+            print("using loop")
+            contrastive_loss = self.loop_compute_contrastive_loss(embeddings_query, embeddings_pos, embeddings_neg)
+        else:
+            # optimised w/o loops  
+            print("not using loop")
+            contrastive_loss = self.compute_contrastive_loss(embeddings_query, embeddings_pos, embeddings_neg)
         
         # computation of sigmoid loss for learning relevancy in query and product pair
-        bce_loss = nn.BCELoss()
-        targets = []
-        # positive exmaples
-        ones_embeds = torch.cat((embeddings_query, embeddings_pos), dim=1)
-        targets.extend([1 for _ in range(num)])
-        # negative examples
-        zeros_embeds = torch.cat((embeddings_query, embeddings_neg), dim=1)
-        targets.extend([0 for _ in range(num)])
-        # all examples
-        all_class_embeds = torch.cat((ones_embeds, zeros_embeds), dim=0)
-        all_targets = torch.tensor(targets, dtype=torch.float32).to(all_class_embeds.device)
-        # forward pass and compute loss
-        rel_scores = model.compute_relevance(all_class_embeds)
-        sigmoid_loss = bce_loss(rel_scores, all_targets)
-        
+        sigmoid_loss = self.compute_sigmoid_loss(embeddings_query, embeddings_pos, embeddings_neg, model)
+
         # total loss
         loss = 1.0 * sigmoid_loss + 1.0 * contrastive_loss
 
@@ -286,6 +327,9 @@ class DataTrainingArguments:
     cl_temperature: Optional[float] = field(
         default=None,
         metadata={"help": "temperature"},
+    )
+    use_loop_loss: bool = field(
+        default=False, metadata={"help": "True, if you want to use code with loops to compute contrastive loss."}
     )
     max_source_length: Optional[int] = field(
         default=512,
@@ -412,9 +456,12 @@ def main():
     data_args.model_name_or_path = model_args.model_name_or_path
     data_args.tokenizer_name_or_path = model_args.model_name_or_path
     training_args.cl_temperature = data_args.cl_temperature
+    training_args.use_loop_loss = data_args.use_loop_loss
     training_args.remove_unused_columns = False
     if not os.path.isdir(data_args.output_dir):
         os.makedirs(data_args.output_dir,exist_ok=True)
+        
+    print("training_args.use_loop_loss:", training_args.use_loop_loss)
 
     # Setup logging
     logging.basicConfig(
@@ -565,6 +612,7 @@ def main():
     trainer = InstructorTrainer(
         model=model,
         args=training_args,
+        use_loop_loss=training_args.use_loop_loss,
         train_dataset=train_dataset,
         eval_dataset=None,
         tokenizer=tokenizer,
