@@ -91,10 +91,69 @@ class InstructorTrainer(Seq2SeqTrainer):
                 seed=seed,
             )
 
+    # def compute_loss(self, model, inputs, return_outputs=False):
+    #     for task_id in inputs['task_name']:
+    #         assert task_id==inputs['task_name'][0],f"Examples in the same batch should come from the same task, " \
+    #                                              f"but task {task_id} and task {inputs['task_name'][0]} are found"
+    #     cur_results = {}
+    #     for k in ['query', 'pos', 'neg']:
+    #         cur_inputs = {
+    #             'input_ids': inputs[f'{k}_input_ids'],
+    #             'attention_mask': inputs[f'{k}_attention_mask'],
+    #             'context_masks': inputs[f'{k}_context_masks'],
+    #         }
+    #         cur_results[k] = model(cur_inputs)['sentence_embedding']
+    #     embeddings_query = cur_results['query']
+    #     embeddings_pos = cur_results['pos']
+    #     embeddings_neg = cur_results['neg']
+
+    #     num = len(embeddings_query)
+    #     all_scores = None
+    #     from torch import nn
+    #     similarity_fct = nn.CosineSimilarity(dim=-1)
+    #     for i in range(0, num):
+    #         anchor_emb = embeddings_query[i].unsqueeze(0)
+    #         pos_emb = embeddings_pos[i].unsqueeze(0)
+    #         cur_score = similarity_fct(anchor_emb, pos_emb) / self.args.cl_temperature
+
+    #         for j in range(0, num):
+    #             one_neg_emb = embeddings_neg[j].unsqueeze(0)
+    #             one_neg_score = similarity_fct(anchor_emb, one_neg_emb) / self.args.cl_temperature
+    #             cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
+    #         if all_scores is None:
+    #             all_scores = cur_score.unsqueeze(0)
+    #         else:
+    #             all_scores = torch.cat([all_scores, cur_score.unsqueeze(0)], dim=0)
+
+    #     labels = torch.zeros(all_scores.size(0)).long().to(embeddings_query.device)
+    #     loss = nn.CrossEntropyLoss()(all_scores, labels)
+
+    #     all_another_scores = None
+    #     for i in range(0, num):
+    #         anchor_emb = embeddings_pos[i].unsqueeze(0)
+    #         pos_emb = embeddings_query[i].unsqueeze(0)
+    #         cur_score = similarity_fct(anchor_emb, pos_emb) / self.args.cl_temperature
+
+    #         for j in range(0, num):
+    #             if i == j:
+    #                 continue
+    #             one_neg_emb = embeddings_query[j].unsqueeze(0)
+    #             one_neg_score = similarity_fct(anchor_emb, one_neg_emb) / self.args.cl_temperature
+    #             cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
+    #         if all_another_scores is None:
+    #             all_another_scores = cur_score.unsqueeze(0)
+    #         else:
+    #             all_another_scores = torch.cat([all_another_scores, cur_score.unsqueeze(0)], dim=0)
+    #     labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeddings_query.device)
+    #     loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
+
+    #     return loss
+    
+    # scaling the distance between anchor and hard negative
     def compute_loss(self, model, inputs, return_outputs=False):
         for task_id in inputs['task_name']:
             assert task_id==inputs['task_name'][0],f"Examples in the same batch should come from the same task, " \
-                                                 f"but task {task_id} and task {inputs['task_name'][0]} are found"
+                                                    f"but task {task_id} and task {inputs['task_name'][0]} are found"
         cur_results = {}
         for k in ['query', 'pos', 'neg']:
             cur_inputs = {
@@ -106,6 +165,10 @@ class InstructorTrainer(Seq2SeqTrainer):
         embeddings_query = cur_results['query']
         embeddings_pos = cur_results['pos']
         embeddings_neg = cur_results['neg']
+        cl_temperature = self.args.cl_temperature
+
+        hard_neg_scale = torch.tensor(3.0)
+        log_hard_neg_scale = torch.log(hard_neg_scale) # log(3) [computed on base e]
 
         num = len(embeddings_query)
         all_scores = None
@@ -114,11 +177,14 @@ class InstructorTrainer(Seq2SeqTrainer):
         for i in range(0, num):
             anchor_emb = embeddings_query[i].unsqueeze(0)
             pos_emb = embeddings_pos[i].unsqueeze(0)
-            cur_score = similarity_fct(anchor_emb, pos_emb) / self.args.cl_temperature
+            cur_score = similarity_fct(anchor_emb, pos_emb) / cl_temperature
 
             for j in range(0, num):
                 one_neg_emb = embeddings_neg[j].unsqueeze(0)
-                one_neg_score = similarity_fct(anchor_emb, one_neg_emb) / self.args.cl_temperature
+                # <new changes>
+                cur_scale = log_hard_neg_scale if i==j else torch.tensor(0.0)
+                one_neg_score = (cur_scale + similarity_fct(anchor_emb, one_neg_emb)) / cl_temperature
+                # </new changes>
                 cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
             if all_scores is None:
                 all_scores = cur_score.unsqueeze(0)
@@ -132,18 +198,19 @@ class InstructorTrainer(Seq2SeqTrainer):
         for i in range(0, num):
             anchor_emb = embeddings_pos[i].unsqueeze(0)
             pos_emb = embeddings_query[i].unsqueeze(0)
-            cur_score = similarity_fct(anchor_emb, pos_emb) / self.args.cl_temperature
+            cur_score = similarity_fct(anchor_emb, pos_emb) / cl_temperature
 
             for j in range(0, num):
                 if i == j:
                     continue
                 one_neg_emb = embeddings_query[j].unsqueeze(0)
-                one_neg_score = similarity_fct(anchor_emb, one_neg_emb) / self.args.cl_temperature
+                one_neg_score = similarity_fct(anchor_emb, one_neg_emb) / cl_temperature
                 cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
             if all_another_scores is None:
                 all_another_scores = cur_score.unsqueeze(0)
             else:
                 all_another_scores = torch.cat([all_another_scores, cur_score.unsqueeze(0)], dim=0)
+
         labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeddings_query.device)
         loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
 
