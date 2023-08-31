@@ -28,6 +28,7 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, is_offline_mode
+import torch.nn as nn
 from torch.utils.data import Dataset, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from transformers.utils.versions import require_version
@@ -167,70 +168,58 @@ class InstructorTrainer(Seq2SeqTrainer):
         embeddings_neg = cur_results['neg']
         cl_temperature = self.args.cl_temperature
 
+        num = len(embeddings_query)
+        similarity_fct = nn.CosineSimilarity(dim=-1)
+
         # <new changes>
         margin_alpha, margin_beta = 0.25, 0.75
         # </new changes>
 
-        num = len(embeddings_query)
-        all_scores = None
-        from torch import nn
-        similarity_fct = nn.CosineSimilarity(dim=-1)
-        for i in range(0, num):
-            anchor_emb = embeddings_query[i].unsqueeze(0)
-            pos_emb = embeddings_pos[i].unsqueeze(0)
-            cur_score = similarity_fct(anchor_emb, pos_emb) / cl_temperature
-
-            for j in range(0, num):
-                one_neg_emb = embeddings_neg[j].unsqueeze(0)
-                # <new changes>
-                cur_margin = margin_beta if i == j else margin_alpha # hard margin if hard negative else softer margin
-                one_neg_score = (similarity_fct(anchor_emb, one_neg_emb) + cur_margin) / cl_temperature
-                # </new changes>
-                cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
-            if all_scores is None:
-                all_scores = cur_score.unsqueeze(0)
-            else:
-                all_scores = torch.cat([all_scores, cur_score.unsqueeze(0)], dim=0)
-
+        # Compute similarity scores between query and pos/neg embeddings
+        query_pos_sim = similarity_fct(embeddings_query, embeddings_pos) 
+        query_neg_sims = similarity_fct(embeddings_query.unsqueeze(1), embeddings_neg)
+        all_scores = torch.cat([query_pos_sim.unsqueeze(-1), query_neg_sims], dim=-1) 
         # <new changes>
+        # adding margins to negatives
+        N, M = all_scores.shape
+        assert(N+1==M)
+        # Create masks
+        j_not_0_mask = (torch.arange(M) != 0).to(embeddings_query.device)
+        i_plus_1_equals_j = (torch.arange(N).unsqueeze(-1) + 1 == torch.arange(M)).to(embeddings_query.device)
+        i_plus_1_not_equals_j = ~i_plus_1_equals_j
+        # Apply scalars based on the masks
+        all_scores[:, j_not_0_mask] += margin_alpha * i_plus_1_not_equals_j[:, j_not_0_mask]
+        all_scores[:, j_not_0_mask] += margin_beta * i_plus_1_equals_j[:, j_not_0_mask]
+        # Apply temperature and clamping
+        all_scores = all_scores / cl_temperature      
         all_scores = all_scores - all_scores[:, 0][:, None]
         all_scores = torch.clamp(all_scores, min=0)
-        # </new changes>
-
+        # </new changes>  
         labels = torch.zeros(all_scores.size(0)).long().to(embeddings_query.device)
-        loss = nn.CrossEntropyLoss()(all_scores, labels)
+        contrastive_loss = nn.CrossEntropyLoss()(all_scores, labels)
 
-        all_another_scores = None
-        for i in range(0, num):
-            anchor_emb = embeddings_pos[i].unsqueeze(0)
-            pos_emb = embeddings_query[i].unsqueeze(0)
-            cur_score = similarity_fct(anchor_emb, pos_emb) / cl_temperature
-
-            for j in range(0, num):
-                if i == j:
-                    continue
-                one_neg_emb = embeddings_query[j].unsqueeze(0)
-                # <new changes>
-                cur_margin = margin_beta if i == j else margin_alpha # hard margin if hard negative else softer margin
-                one_neg_score = (similarity_fct(anchor_emb, one_neg_emb) + cur_margin) / cl_temperature
-                # </new changes>
-                cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
-            if all_another_scores is None:
-                all_another_scores = cur_score.unsqueeze(0)
-            else:
-                all_another_scores = torch.cat([all_another_scores, cur_score.unsqueeze(0)], dim=0)
-
+        # Compute similarity scores between pos embeddings and query/neg embeddings
+        all_another_scores = similarity_fct(embeddings_pos.unsqueeze(1), embeddings_query.unsqueeze(0))
         # <new changes>
-        all_another_scores = all_another_scores - all_another_scores[:, 0][:, None]
+        # adding margins to negatives
+        N, M = all_another_scores.shape
+        assert(N==M)
+        # Create mask for the condition
+        i_equals_j = (torch.arange(N).unsqueeze(-1) == torch.arange(M)).to(embeddings_query.device)
+        i_not_equals_j = ~i_equals_j
+        # Apply condition
+        all_another_scores +=  (margin_alpha * i_not_equals_j)
+        # Apply temperature and clamping
+        all_another_scores = all_another_scores / cl_temperature
+        all_another_scores = all_another_scores - all_another_scores[i_equals_j][:, None]
         all_another_scores = torch.clamp(all_another_scores, min=0)
         # </new changes>
+        labels_another = torch.arange(0, num).long().to(embeddings_query.device)
+        contrastive_loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
 
-        labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeddings_query.device)
-        loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
+        print(contrastive_loss)
+        return contrastive_loss
 
-        if return_outputs:
-            return loss, all_scores
-        return loss 
 
 @dataclass
 class ModelArguments:
