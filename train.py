@@ -217,7 +217,6 @@ class InstructorTrainer(Seq2SeqTrainer):
         labels_another = torch.arange(0, num).long().to(embeddings_query.device)
         contrastive_loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
 
-        print(contrastive_loss)
         return contrastive_loss
 
 
