@@ -32,7 +32,7 @@ from torch.utils.data import Dataset, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from transformers.utils.versions import require_version
 from datasets import Dataset,DatasetDict
-
+from torch import nn
 
 check_min_version("4.20.0.dev0")
 
@@ -171,50 +171,31 @@ class InstructorTrainer(Seq2SeqTrainer):
         log_hard_neg_scale = torch.log(hard_neg_scale) # log(3) [computed on base e]
 
         num = len(embeddings_query)
-        all_scores = None
-        from torch import nn
         similarity_fct = nn.CosineSimilarity(dim=-1)
-        for i in range(0, num):
-            anchor_emb = embeddings_query[i].unsqueeze(0)
-            pos_emb = embeddings_pos[i].unsqueeze(0)
-            cur_score = similarity_fct(anchor_emb, pos_emb) / cl_temperature
 
-            for j in range(0, num):
-                one_neg_emb = embeddings_neg[j].unsqueeze(0)
-                # <new changes>
-                cur_scale = log_hard_neg_scale if i==j else torch.tensor(0.0)
-                one_neg_score = (cur_scale + similarity_fct(anchor_emb, one_neg_emb)) / cl_temperature
-                # </new changes>
-                cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
-            if all_scores is None:
-                all_scores = cur_score.unsqueeze(0)
-            else:
-                all_scores = torch.cat([all_scores, cur_score.unsqueeze(0)], dim=0)
-
+        # Compute similarity scores between query and pos/neg embeddings
+        query_pos_sim = similarity_fct(embeddings_query, embeddings_pos) 
+        query_neg_sims = similarity_fct(embeddings_query.unsqueeze(1), embeddings_neg)
+        all_scores = torch.cat([query_pos_sim.unsqueeze(-1), query_neg_sims], dim=-1) 
+        # <new changes>
+        N, M = all_scores.shape
+        assert(N+1==M)
+        # Create masks
+        i_plus_1_equals_j = (torch.arange(N).unsqueeze(-1) + 1 == torch.arange(M)).to(embeddings_query.device)
+        # Apply scalars based on the masks
+        all_scores += (log_hard_neg_scale * i_plus_1_equals_j)
+        # </new changes>  
+        all_scores = all_scores / cl_temperature      
         labels = torch.zeros(all_scores.size(0)).long().to(embeddings_query.device)
-        loss = nn.CrossEntropyLoss()(all_scores, labels)
+        contrastive_loss = nn.CrossEntropyLoss()(all_scores, labels)
 
-        all_another_scores = None
-        for i in range(0, num):
-            anchor_emb = embeddings_pos[i].unsqueeze(0)
-            pos_emb = embeddings_query[i].unsqueeze(0)
-            cur_score = similarity_fct(anchor_emb, pos_emb) / cl_temperature
+        # Compute similarity scores between pos embeddings and query/neg embeddings
+        all_another_scores = similarity_fct(embeddings_pos.unsqueeze(1), embeddings_query.unsqueeze(0))
+        all_another_scores = all_another_scores / cl_temperature
+        labels_another = torch.arange(0, num).long().to(embeddings_query.device)
+        contrastive_loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
 
-            for j in range(0, num):
-                if i == j:
-                    continue
-                one_neg_emb = embeddings_query[j].unsqueeze(0)
-                one_neg_score = similarity_fct(anchor_emb, one_neg_emb) / cl_temperature
-                cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
-            if all_another_scores is None:
-                all_another_scores = cur_score.unsqueeze(0)
-            else:
-                all_another_scores = torch.cat([all_another_scores, cur_score.unsqueeze(0)], dim=0)
-
-        labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeddings_query.device)
-        loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
-
-        return loss
+        return contrastive_loss
 
 @dataclass
 class ModelArguments:
