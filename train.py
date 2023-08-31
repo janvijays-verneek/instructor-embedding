@@ -167,7 +167,7 @@ class InstructorTrainer(Seq2SeqTrainer):
         embeddings_neg = cur_results['neg']
         cl_temperature = self.args.cl_temperature
 
-        hard_neg_scale = torch.tensor(3.0)
+        hard_neg_scale = torch.tensor(40.0) # increasing for a batch size of 80.0
         log_hard_neg_scale = torch.log(hard_neg_scale) # log(3) [computed on base e]
 
         num = len(embeddings_query)
