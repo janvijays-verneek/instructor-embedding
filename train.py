@@ -156,6 +156,13 @@ class InstructorTrainer(Seq2SeqTrainer):
                 gathered_embeddings_neg = torch.cat(gathered_embeddings_neg, dim=0).to(gather_device_rank)
                 gathered_embeddings_neg.requires_grad_()
                 
+                # Log the tensor size the first time
+                if not hasattr(self, "printed_tensor_size"):
+                    logger.info(f"*** query embedding tensor size: {gathered_embeddings_query.size()}")
+                    logger.info(f"*** pos embedding tensor size: {gathered_embeddings_pos.size()}")
+                    logger.info(f"*** neg embedding tensor size: {gathered_embeddings_neg.size()}")
+                    self.printed_tensor_size = True
+
                 loss = compute_constrastive_loss(gathered_embeddings_query, gathered_embeddings_pos, gathered_embeddings_neg, cl_temperature)
                 loss_tensor = torch.tensor([loss.item()]).to(self.args.process_index)
                 loss.backward(retain_graph=True)
