@@ -445,7 +445,6 @@ class DataTrainingArguments:
     source_prefix: Optional[str] = field(
         default="", metadata={"help": "A prefix to add before every source text (useful for T5 models)."}
     )
-
     forced_bos_token: Optional[str] = field(
         default=None,
         metadata={
@@ -456,6 +455,7 @@ class DataTrainingArguments:
             )
         },
     )
+    local_rank: Optional[int] = field(default=-1, metadata={"help": "Local rank for distributed training"})
     def __post_init__(self):
         pass
 
@@ -490,6 +490,11 @@ def main():
     training_args.remove_unused_columns = False
     if not os.path.isdir(data_args.output_dir):
         os.makedirs(data_args.output_dir,exist_ok=True)
+
+    if data_args.local_rank != -1:
+        print(f"Initializing distributed training with local rank {data_args.local_rank}")
+        torch.cuda.set_device(data_args.local_rank)
+        torch.distributed.init_process_group(backend='nccl')
 
     # Setup logging
     logging.basicConfig(
