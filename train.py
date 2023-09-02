@@ -34,6 +34,14 @@ from transformers.utils.versions import require_version
 from datasets import Dataset,DatasetDict
 from torch import nn
 
+import torch.distributed as dist
+from transformers import utils
+from typing import Dict, Union, Any
+if utils.is_sagemaker_mp_enabled():
+    from transformers.trainer_pt_utils import smp_forward_backward
+if utils.is_apex_available():
+    from apex import amp
+
 check_min_version("4.20.0.dev0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summarization/requirements.txt")
@@ -91,65 +99,6 @@ class InstructorTrainer(Seq2SeqTrainer):
                 seed=seed,
             )
 
-    # def compute_loss(self, model, inputs, return_outputs=False):
-    #     for task_id in inputs['task_name']:
-    #         assert task_id==inputs['task_name'][0],f"Examples in the same batch should come from the same task, " \
-    #                                              f"but task {task_id} and task {inputs['task_name'][0]} are found"
-    #     cur_results = {}
-    #     for k in ['query', 'pos', 'neg']:
-    #         cur_inputs = {
-    #             'input_ids': inputs[f'{k}_input_ids'],
-    #             'attention_mask': inputs[f'{k}_attention_mask'],
-    #             'context_masks': inputs[f'{k}_context_masks'],
-    #         }
-    #         cur_results[k] = model(cur_inputs)['sentence_embedding']
-    #     embeddings_query = cur_results['query']
-    #     embeddings_pos = cur_results['pos']
-    #     embeddings_neg = cur_results['neg']
-
-    #     num = len(embeddings_query)
-    #     all_scores = None
-    #     from torch import nn
-    #     similarity_fct = nn.CosineSimilarity(dim=-1)
-    #     for i in range(0, num):
-    #         anchor_emb = embeddings_query[i].unsqueeze(0)
-    #         pos_emb = embeddings_pos[i].unsqueeze(0)
-    #         cur_score = similarity_fct(anchor_emb, pos_emb) / self.args.cl_temperature
-
-    #         for j in range(0, num):
-    #             one_neg_emb = embeddings_neg[j].unsqueeze(0)
-    #             one_neg_score = similarity_fct(anchor_emb, one_neg_emb) / self.args.cl_temperature
-    #             cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
-    #         if all_scores is None:
-    #             all_scores = cur_score.unsqueeze(0)
-    #         else:
-    #             all_scores = torch.cat([all_scores, cur_score.unsqueeze(0)], dim=0)
-
-    #     labels = torch.zeros(all_scores.size(0)).long().to(embeddings_query.device)
-    #     loss = nn.CrossEntropyLoss()(all_scores, labels)
-
-    #     all_another_scores = None
-    #     for i in range(0, num):
-    #         anchor_emb = embeddings_pos[i].unsqueeze(0)
-    #         pos_emb = embeddings_query[i].unsqueeze(0)
-    #         cur_score = similarity_fct(anchor_emb, pos_emb) / self.args.cl_temperature
-
-    #         for j in range(0, num):
-    #             if i == j:
-    #                 continue
-    #             one_neg_emb = embeddings_query[j].unsqueeze(0)
-    #             one_neg_score = similarity_fct(anchor_emb, one_neg_emb) / self.args.cl_temperature
-    #             cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
-    #         if all_another_scores is None:
-    #             all_another_scores = cur_score.unsqueeze(0)
-    #         else:
-    #             all_another_scores = torch.cat([all_another_scores, cur_score.unsqueeze(0)], dim=0)
-    #     labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeddings_query.device)
-    #     loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
-
-    #     return loss
-    
-    # scaling the distance between anchor and hard negative
     def compute_loss(self, model, inputs, return_outputs=False):
         for task_id in inputs['task_name']:
             assert task_id==inputs['task_name'][0],f"Examples in the same batch should come from the same task, " \
@@ -162,40 +111,133 @@ class InstructorTrainer(Seq2SeqTrainer):
                 'context_masks': inputs[f'{k}_context_masks'],
             }
             cur_results[k] = model(cur_inputs)['sentence_embedding']
-        embeddings_query = cur_results['query']
-        embeddings_pos = cur_results['pos']
-        embeddings_neg = cur_results['neg']
-        cl_temperature = self.args.cl_temperature
 
-        hard_neg_scale = torch.tensor(3.0)
-        log_hard_neg_scale = torch.log(hard_neg_scale) # log(3) [computed on base e]
+        embeddings_query, embeddings_pos, embeddings_neg, cl_temperature = \
+            cur_results['query'], cur_results['pos'], cur_results['neg'], self.args.cl_temperature
 
-        num = len(embeddings_query)
-        similarity_fct = nn.CosineSimilarity(dim=-1)
+        is_distributed = (self.args.local_rank != -1)
+        if is_distributed:
+            gather_device_rank = 0 
+            gathered_embeddings_query = [torch.zeros_like(embeddings_query) for _ in range(self.args.world_size)]
+            dist.all_gather(gathered_embeddings_query, embeddings_query)
+            gathered_embeddings_pos = [torch.zeros_like(embeddings_pos) for _ in range(self.args.world_size)]
+            dist.all_gather(gathered_embeddings_pos, embeddings_pos)
+            gathered_embeddings_neg = [torch.zeros_like(embeddings_neg) for _ in range(self.args.world_size)]
+            dist.all_gather(gathered_embeddings_neg, embeddings_neg)
 
-        # Compute similarity scores between query and pos/neg embeddings
-        query_pos_sim = similarity_fct(embeddings_query, embeddings_pos) 
-        query_neg_sims = similarity_fct(embeddings_query.unsqueeze(1), embeddings_neg)
-        all_scores = torch.cat([query_pos_sim.unsqueeze(-1), query_neg_sims], dim=-1) 
-        # <new changes>
-        N, M = all_scores.shape
-        assert(N+1==M)
-        # Create masks
-        i_plus_1_equals_j = (torch.arange(N).unsqueeze(-1) + 1 == torch.arange(M)).to(embeddings_query.device)
-        # Apply scalars based on the masks
-        all_scores += (log_hard_neg_scale * i_plus_1_equals_j)
-        # </new changes>  
-        all_scores = all_scores / cl_temperature      
-        labels = torch.zeros(all_scores.size(0)).long().to(embeddings_query.device)
-        contrastive_loss = nn.CrossEntropyLoss()(all_scores, labels)
+        def compute_constrastive_loss(embeddings_query, embeddings_pos, embeddings_neg, cl_temperature):
+            num = len(embeddings_query)
+            similarity_fct = nn.CosineSimilarity(dim=-1)
 
-        # Compute similarity scores between pos embeddings and query/neg embeddings
-        all_another_scores = similarity_fct(embeddings_pos.unsqueeze(1), embeddings_query.unsqueeze(0))
-        all_another_scores = all_another_scores / cl_temperature
-        labels_another = torch.arange(0, num).long().to(embeddings_query.device)
-        contrastive_loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
+            # Compute similarity scores between query and pos/neg embeddings
+            query_pos_sim = similarity_fct(embeddings_query, embeddings_pos) 
+            query_neg_sims = similarity_fct(embeddings_query.unsqueeze(1), embeddings_neg)
+            all_scores = torch.cat([query_pos_sim.unsqueeze(-1), query_neg_sims], dim=-1) 
+            all_scores = all_scores / cl_temperature      
+            labels = torch.zeros(all_scores.size(0)).long().to(embeddings_query.device)
+            contrastive_loss = nn.CrossEntropyLoss()(all_scores, labels)
 
-        return contrastive_loss
+            # Compute similarity scores between pos embeddings and query/neg embeddings
+            all_another_scores = similarity_fct(embeddings_pos.unsqueeze(1), embeddings_query.unsqueeze(0))
+            all_another_scores = all_another_scores / cl_temperature
+            labels_another = torch.arange(0, num).long().to(embeddings_query.device)
+            contrastive_loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
+
+            return contrastive_loss
+
+        if not is_distributed:
+            loss_tensor = compute_constrastive_loss(embeddings_query, embeddings_pos, embeddings_neg, cl_temperature)
+        else:
+            if self.args.process_index == gather_device_rank:
+                gathered_embeddings_query = torch.cat(gathered_embeddings_query, dim=0).to(gather_device_rank)
+                gathered_embeddings_query.requires_grad_()
+                gathered_embeddings_pos = torch.cat(gathered_embeddings_pos, dim=0).to(gather_device_rank)
+                gathered_embeddings_pos.requires_grad_()
+                gathered_embeddings_neg = torch.cat(gathered_embeddings_neg, dim=0).to(gather_device_rank)
+                gathered_embeddings_neg.requires_grad_()
+                
+                loss = compute_constrastive_loss(gathered_embeddings_query, gathered_embeddings_pos, gathered_embeddings_neg, cl_temperature)
+                loss_tensor = torch.tensor([loss.item()]).to(self.args.process_index)
+                loss.backward(retain_graph=True)
+
+                scattered_embeddings_query_grad = list(gathered_embeddings_query.grad.split(embeddings_query.size(0)))
+                scattered_embeddings_pos_grad = list(gathered_embeddings_pos.grad.split(embeddings_pos.size(0)))
+                scattered_embeddings_neg_grad = list(gathered_embeddings_neg.grad.split(embeddings_neg.size(0)))
+            else:
+                scattered_embeddings_query_grad, scattered_embeddings_pos_grad, scattered_embeddings_neg_grad = None, None, None
+                loss_tensor = torch.zeros(1).to(self.args.process_index)
+
+            embeddings_query_grad = torch.ones_like(embeddings_query)
+            dist.scatter(embeddings_query_grad, scattered_embeddings_query_grad, src=gather_device_rank)
+            embeddings_query.grad = embeddings_query_grad 
+
+            embeddings_pos_grad = torch.ones_like(embeddings_pos)
+            dist.scatter(embeddings_pos_grad, scattered_embeddings_pos_grad, src=gather_device_rank)
+            embeddings_pos.grad = embeddings_pos_grad 
+
+            embeddings_neg_grad = torch.ones_like(embeddings_neg)
+            dist.scatter(embeddings_neg_grad, scattered_embeddings_neg_grad, src=gather_device_rank)
+            embeddings_neg.grad = embeddings_neg_grad 
+
+            dist.broadcast(loss_tensor, src=gather_device_rank)
+
+            embeddings_query.backward(torch.ones_like(embeddings_query)) #, retain_graph=True) 
+            embeddings_pos.backward(torch.ones_like(embeddings_pos)) #, retain_graph=True) 
+            embeddings_neg.backward(torch.ones_like(embeddings_neg)) 
+
+        return loss_tensor, is_distributed
+
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        """
+        Perform a training step on a batch of inputs.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to train.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+
+        Return:
+            `torch.Tensor`: The tensor with training loss on this batch.
+        """
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        if utils.is_sagemaker_mp_enabled():
+            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+            return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        with self.compute_loss_context_manager():
+            loss, is_distributed = self.compute_loss(model, inputs)
+
+        if not is_distributed:
+            if self.args.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+            if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+                # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
+                loss = loss / self.args.gradient_accumulation_steps
+
+            if self.do_grad_scaling:
+                self.scaler.scale(loss).backward()
+            elif self.use_apex:
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            elif self.deepspeed:
+                # loss gets scaled under gradient_accumulation_steps in deepspeed
+                loss = self.deepspeed.backward(loss)
+            else:
+                loss.backward()
+        else:
+            # grads computed inside the compute_loss function itself
+            loss = loss[0]
+
+        return loss.detach()
 
 @dataclass
 class ModelArguments:
