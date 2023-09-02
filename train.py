@@ -158,14 +158,14 @@ class InstructorTrainer(Seq2SeqTrainer):
                 
                 # Log the tensor size the first time
                 if not hasattr(self, "printed_tensor_size"):
-                    logger.info(f"*** query embedding tensor size: {gathered_embeddings_query.size()}")
-                    logger.info(f"*** pos embedding tensor size: {gathered_embeddings_pos.size()}")
-                    logger.info(f"*** neg embedding tensor size: {gathered_embeddings_neg.size()}")
+                    print(f"*** query embedding tensor size for loss: {gathered_embeddings_query.size()}")
+                    print(f"*** pos embedding tensor size for loss: {gathered_embeddings_pos.size()}")
+                    print(f"*** neg embedding tensor size for loss: {gathered_embeddings_neg.size()}")
                     self.printed_tensor_size = True
 
                 loss = compute_constrastive_loss(gathered_embeddings_query, gathered_embeddings_pos, gathered_embeddings_neg, cl_temperature)
                 loss_tensor = torch.tensor([loss.item()]).to(self.args.process_index)
-                loss.backward(retain_graph=True)
+                loss.backward()
 
                 scattered_embeddings_query_grad = list(gathered_embeddings_query.grad.split(embeddings_query.size(0)))
                 scattered_embeddings_pos_grad = list(gathered_embeddings_pos.grad.split(embeddings_pos.size(0)))
@@ -455,7 +455,7 @@ class DataTrainingArguments:
             )
         },
     )
-    local_rank: Optional[int] = field(default=-1, metadata={"help": "Local rank for distributed training"})
+    # local_rank: Optional[int] = field(default=-1, metadata={"help": "Local rank for distributed training"})
     def __post_init__(self):
         pass
 
@@ -491,10 +491,10 @@ def main():
     if not os.path.isdir(data_args.output_dir):
         os.makedirs(data_args.output_dir,exist_ok=True)
 
-    if data_args.local_rank != -1:
-        print(f"Initializing distributed training with local rank {data_args.local_rank}")
-        torch.cuda.set_device(data_args.local_rank)
-        torch.distributed.init_process_group(backend='nccl')
+    # if data_args.local_rank != -1:
+    #     print(f"Initializing distributed training with local rank {data_args.local_rank}")
+    #     torch.cuda.set_device(data_args.local_rank)
+    #     torch.distributed.init_process_group(backend='nccl')
 
     # Setup logging
     logging.basicConfig(
