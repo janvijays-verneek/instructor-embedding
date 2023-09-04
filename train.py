@@ -238,11 +238,12 @@ class InstructorTrainer(Seq2SeqTrainer):
             loss_tensor = torch.tensor([1.,]).to(self.args.process_index)
             dist.scatter(loss_tensor, scattered_loss_tensor, src=gather_device_rank)
 
-            embeddings_query.backward(embeddings_query_grad) 
-            embeddings_pos.backward(embeddings_pos_grad) 
-            embeddings_neg.backward(embeddings_neg_grad) 
-
-        return loss_tensor, is_distributed
+        return loss_tensor, is_distributed, \
+            [
+                [embeddings_query, embeddings_query_grad],
+                [embeddings_pos, embeddings_pos_grad],
+                [embeddings_neg, embeddings_neg_grad]
+            ] if is_distributed else None
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
@@ -271,29 +272,31 @@ class InstructorTrainer(Seq2SeqTrainer):
                 return loss_mb.reduce_mean().detach().to(self.args.device)
 
             with self.compute_loss_context_manager():
-                loss, is_distributed = self.compute_loss(model, inputs)
+                loss, is_distributed, dist_embed_grad = self.compute_loss(model, inputs)
 
-            if not is_distributed:
-                if self.args.n_gpu > 1:
-                    loss = loss.mean()  # mean() to average on multi-gpu parallel training
+        # backward pass outside no_sync context | grads automatically synced by ddp
+        if not is_distributed:
+            if self.args.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-                if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
-                    # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
-                    loss = loss / self.args.gradient_accumulation_steps
+            if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+                # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
+                loss = loss / self.args.gradient_accumulation_steps
 
-                if self.do_grad_scaling:
-                    self.scaler.scale(loss).backward()
-                elif self.use_apex:
-                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                elif self.deepspeed:
-                    # loss gets scaled under gradient_accumulation_steps in deepspeed
-                    loss = self.deepspeed.backward(loss)
-                else:
-                    loss.backward()
+            if self.do_grad_scaling:
+                self.scaler.scale(loss).backward()
+            elif self.use_apex:
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            elif self.deepspeed:
+                # loss gets scaled under gradient_accumulation_steps in deepspeed
+                loss = self.deepspeed.backward(loss)
             else:
-                # grads computed inside the compute_loss function itself
-                loss = loss[0]
+                loss.backward()
+        else:
+            loss = loss[0]
+            for embedding, embedding_grad in dist_embed_grad:
+                embedding.backward(embedding_grad) 
 
         # # print some gradients for debugging across various algos
         # for rank in range(self.args.world_size):
