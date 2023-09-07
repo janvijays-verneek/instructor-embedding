@@ -172,7 +172,7 @@ class InstructorTrainer(Seq2SeqTrainer):
         similarity_fct = nn.CosineSimilarity(dim=-1)
 
         # <new changes>
-        margin_alpha, margin_beta = 0.25, 0.75
+        margin_alpha, margin_beta = 1.0, 2.0
         # </new changes>
 
         # Compute similarity scores between query and pos/neg embeddings
@@ -198,24 +198,24 @@ class InstructorTrainer(Seq2SeqTrainer):
         labels = torch.zeros(all_scores.size(0)).long().to(embeddings_query.device)
         contrastive_loss = nn.CrossEntropyLoss()(all_scores, labels)
 
-        # Compute similarity scores between pos embeddings and query/neg embeddings
-        all_another_scores = similarity_fct(embeddings_pos.unsqueeze(1), embeddings_query.unsqueeze(0))
-        # <new changes>
-        # adding margins to negatives
-        N, M = all_another_scores.shape
-        assert(N==M)
-        # Create mask for the condition
-        i_equals_j = (torch.arange(N).unsqueeze(-1) == torch.arange(M)).to(embeddings_query.device)
-        i_not_equals_j = ~i_equals_j
-        # Apply condition
-        all_another_scores +=  (margin_alpha * i_not_equals_j)
-        # Apply temperature and clamping
-        all_another_scores = all_another_scores / cl_temperature
-        all_another_scores = all_another_scores - all_another_scores[i_equals_j][:, None]
-        all_another_scores = torch.clamp(all_another_scores, min=0)
-        # </new changes>
-        labels_another = torch.arange(0, num).long().to(embeddings_query.device)
-        contrastive_loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
+        # # Compute similarity scores between pos embeddings and query/neg embeddings
+        # all_another_scores = similarity_fct(embeddings_pos.unsqueeze(1), embeddings_query.unsqueeze(0))
+        # # <new changes>
+        # # adding margins to negatives
+        # N, M = all_another_scores.shape
+        # assert(N==M)
+        # # Create mask for the condition
+        # i_equals_j = (torch.arange(N).unsqueeze(-1) == torch.arange(M)).to(embeddings_query.device)
+        # i_not_equals_j = ~i_equals_j
+        # # Apply condition
+        # all_another_scores +=  (margin_alpha * i_not_equals_j)
+        # # Apply temperature and clamping
+        # all_another_scores = all_another_scores / cl_temperature
+        # all_another_scores = all_another_scores - all_another_scores[i_equals_j][:, None]
+        # all_another_scores = torch.clamp(all_another_scores, min=0)
+        # # </new changes>
+        # labels_another = torch.arange(0, num).long().to(embeddings_query.device)
+        # contrastive_loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
 
         return contrastive_loss
 
